@@ -1,388 +1,271 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+Data preparation and runtime utilities for quantitative trading autoresearch.
+
+Loads LOB (Limit Order Book) and trade data from local numpy files.
+Provides dataloader and evaluation utilities used by train.py.
+
+Data format:
+    - lob_data:    (T, 4, 10) — [ask_price, bid_price, ask_notional, bid_notional] x 10 levels
+    - trade_data:  (T, 23)    — 23 aggregated trade features per 100ms window
+    - labels_ret:  (T,)       — future 180s return for classification
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
-
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+    python prepare.py          # verify data exists and print stats
 """
 
 import os
-import sys
-import time
-import math
-import argparse
-import pickle
-from multiprocessing import Pool
+import numpy as np
 
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
 import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, RandomSampler
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+SEQ_LEN = 2000               # sliding window size (100ms intervals = 200 seconds)
+NUM_EPOCHS = 3                # number of training epochs
+EPOCH_TIME_BUDGET = 600       # max seconds per epoch (10 minutes)
+TOTAL_TIME_BUDGET = 1800      # max total training seconds (30 minutes)
+NUM_CLASSES = 3               # [Down(0), Stationary(1), Up(2)]
+EVAL_SAMPLES = 10000          # number of samples for validation evaluation
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Data directories
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
-
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
+TRAIN_DATA_DIR = '/root/autodl-tmp/train_data'
+TEST_DATA_DIR = '/root/autodl-tmp/test_data'
+MODEL_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Model', 'model_config.yaml')
 
 # ---------------------------------------------------------------------------
-# Data download
+# Data loading
 # ---------------------------------------------------------------------------
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
-
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+_data_cache = {}
+_threshold_cache = None
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
+def load_data(data_dir):
+    """
+    Load LOB, trade, and label data from a directory.
+    Uses memory-mapped files for efficiency with large datasets.
+    Returns cached results on repeated calls.
+    """
+    if data_dir in _data_cache:
+        return _data_cache[data_dir]
 
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
+    lob_path = os.path.join(data_dir, 'lob_data.npy')
+    trade_path = os.path.join(data_dir, 'trade_data.npy')
+    labels_path = os.path.join(data_dir, 'trade_labels_ret.npy')
 
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
+    for p in [lob_path, trade_path, labels_path]:
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"Data file not found: {p}")
 
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
+    lob = np.load(lob_path, mmap_mode='r')
+    trade = np.load(trade_path, mmap_mode='r')
+    labels_ret = np.load(labels_path, mmap_mode='r')
 
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
-
-# ---------------------------------------------------------------------------
-# Tokenizer training
-# ---------------------------------------------------------------------------
-
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
+    _data_cache[data_dir] = (lob, trade, labels_ret)
+    return lob, trade, labels_ret
 
 
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+def compute_label_thresholds(returns):
+    """
+    Compute classification thresholds from continuous returns using terciles.
+    Bottom 1/3 → Down(0), Middle 1/3 → Stationary(1), Top 1/3 → Up(2).
+    Thresholds are cached after first computation.
+    """
+    global _threshold_cache
+    if _threshold_cache is not None:
+        return _threshold_cache
 
-
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
-
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
-
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
-
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
-
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
-
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
-    )
-
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
-
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
-
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
-
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
-
-# ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
-# ---------------------------------------------------------------------------
-
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
-
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
-
-
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
-
-
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
+    if hasattr(returns, 'shape') and len(returns) > 1_000_000:
+        # Subsample for faster percentile computation on large arrays
+        rng = np.random.default_rng(42)
+        indices = rng.choice(len(returns), size=1_000_000, replace=False)
+        sample = np.array(returns[indices])
     else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
+        sample = np.array(returns)
+
+    _threshold_cache = np.percentile(sample, [33.33, 66.67])
+    return _threshold_cache
 
 
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+def returns_to_classes(returns, thresholds):
+    """Convert continuous returns to 3-class labels."""
+    labels = np.ones(len(returns), dtype=np.int64)  # default: Stationary(1)
+    labels[returns < thresholds[0]] = 0  # Down
+    labels[returns > thresholds[1]] = 2  # Up
+    return labels
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+class QuantDataset(Dataset):
     """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
+    Sliding window dataset for LOB + Trade multimodal data.
+
+    Each sample is a window of SEQ_LEN consecutive timesteps.
+    The label corresponds to the last timestep in the window.
+
+    Output shapes per sample:
+        lob:   (4, SEQ_LEN, 10)  — [C, T, L] for Conv2d
+        trade: (23, SEQ_LEN)     — [F, T] for Conv1d
+        label: scalar (int64)    — class index {0, 1, 2}
     """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
 
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
+    def __init__(self, lob_data, trade_data, labels, seq_len):
+        self.lob = lob_data
+        self.trade = trade_data
+        self.labels = labels
+        self.seq_len = seq_len
+        self.n_samples = len(lob_data) - seq_len
 
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+    def __len__(self):
+        return max(0, self.n_samples)
 
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
+    def __getitem__(self, idx):
+        end = idx + self.seq_len
+        # LOB: (T, C, L) → (C, T, L)
+        lob = torch.from_numpy(self.lob[idx:end].copy()).permute(1, 0, 2).float()
+        # Trade: (T, F) → (F, T)
+        trade = torch.from_numpy(self.trade[idx:end].copy()).t().contiguous().float()
+        # Label at window end
+        label = torch.tensor(self.labels[end - 1], dtype=torch.long)
+        return lob, trade, label
 
-                remaining = row_capacity - pos
 
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
+# ---------------------------------------------------------------------------
+# Dataloader factory
+# ---------------------------------------------------------------------------
 
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
+def make_dataloader(split, batch_size, seq_len=SEQ_LEN,
+                    samples_per_epoch=None, num_workers=4):
+    """
+    Create a DataLoader for training or validation.
 
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
+    Args:
+        split: 'train' or 'val'
+        batch_size: batch size
+        seq_len: sliding window length
+        samples_per_epoch: number of random samples per epoch (None = auto)
+        num_workers: DataLoader workers
+
+    Returns:
+        DataLoader yielding (lob, trade, label) batches
+    """
+    assert split in ['train', 'val']
+    data_dir = TRAIN_DATA_DIR if split == 'train' else TEST_DATA_DIR
+
+    lob, trade, labels_ret = load_data(data_dir)
+
+    # Always use training set thresholds for label generation
+    train_lob, train_trade, train_ret = load_data(TRAIN_DATA_DIR)
+    thresholds = compute_label_thresholds(train_ret)
+    labels = returns_to_classes(np.array(labels_ret), thresholds)
+
+    dataset = QuantDataset(lob, trade, labels, seq_len)
+
+    if split == 'train':
+        if samples_per_epoch is None:
+            samples_per_epoch = min(len(dataset), 200_000)
+        sampler = RandomSampler(dataset, replacement=True,
+                                num_samples=samples_per_epoch)
+        return DataLoader(dataset, batch_size=batch_size, sampler=sampler,
+                          num_workers=num_workers, pin_memory=True,
+                          drop_last=True, persistent_workers=num_workers > 0)
+    else:
+        eval_samples = min(EVAL_SAMPLES, len(dataset))
+        sampler = RandomSampler(dataset, replacement=False,
+                                num_samples=eval_samples)
+        return DataLoader(dataset, batch_size=batch_size, sampler=sampler,
+                          num_workers=num_workers, pin_memory=True,
+                          drop_last=False, persistent_workers=num_workers > 0)
+
 
 # ---------------------------------------------------------------------------
 # Evaluation (DO NOT CHANGE — this is the fixed metric)
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+def evaluate_loss(model, device='cuda', batch_size=64, seq_len=SEQ_LEN):
     """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
+    Evaluate model on validation set. Returns average cross-entropy loss.
+    Lower is better.
+
+    Uses a fixed number of random validation samples (EVAL_SAMPLES)
+    for consistent and comparable evaluation across experiments.
     """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
+    model.eval()
+    val_loader = make_dataloader('val', batch_size, seq_len=seq_len, num_workers=2)
+    total_loss = 0.0
+    total_samples = 0
+
+    for lob, trade, labels in val_loader:
+        lob = lob.to(device, non_blocking=True)
+        trade = trade.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        inputs = {'lob': lob, 'trade': trade}
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits = model(inputs)
+        loss = F.cross_entropy(logits, labels)
+
+        total_loss += loss.item() * labels.size(0)
+        total_samples += labels.size(0)
+
+    model.train()
+    return total_loss / total_samples if total_samples > 0 else float('inf')
+
 
 # ---------------------------------------------------------------------------
-# Main
+# Main — data verification
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
-    args = parser.parse_args()
+    print("=" * 60)
+    print("Quantitative Trading Autoresearch — Data Verification")
+    print("=" * 60)
 
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
+    for name, data_dir in [("Train", TRAIN_DATA_DIR), ("Test", TEST_DATA_DIR)]:
+        print(f"\n--- {name} data: {data_dir} ---")
+        try:
+            lob, trade, labels_ret = load_data(data_dir)
+            print(f"  lob_data shape:    {lob.shape}  (T, C=4, L=10)")
+            print(f"  trade_data shape:  {trade.shape}  (T, F=23)")
+            print(f"  labels_ret shape:  {labels_ret.shape}  (T,)")
+            print(f"  timesteps:         {len(lob):,}")
 
-    print(f"Cache directory: {CACHE_DIR}")
-    print()
+            ret_sample = np.array(labels_ret[:min(100000, len(labels_ret))])
+            print(f"  returns range:     [{ret_sample.min():.6f}, {ret_sample.max():.6f}]")
+            print(f"  returns mean:      {ret_sample.mean():.6f}")
+            print(f"  returns std:       {ret_sample.std():.6f}")
 
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
+            n_windows = len(lob) - SEQ_LEN
+            print(f"  possible windows:  {n_windows:,} (seq_len={SEQ_LEN})")
+        except FileNotFoundError as e:
+            print(f"  NOT FOUND: {e}")
 
-    # Step 2: Train tokenizer
-    train_tokenizer()
-    print()
-    print("Done! Ready to train.")
+    # Label thresholds
+    try:
+        _, _, train_ret = load_data(TRAIN_DATA_DIR)
+        thresholds = compute_label_thresholds(train_ret)
+        print(f"\nLabel thresholds (33/67 percentile): {thresholds}")
+
+        labels = returns_to_classes(np.array(train_ret[:min(100000, len(train_ret))]),
+                                    thresholds)
+        for c in range(NUM_CLASSES):
+            pct = (labels == c).sum() / len(labels) * 100
+            class_name = ['Down', 'Stationary', 'Up'][c]
+            print(f"  Class {c} ({class_name}): {pct:.1f}%")
+    except Exception as e:
+        print(f"\nCould not compute thresholds: {e}")
+
+    print(f"\nModel config: {MODEL_CONFIG_PATH}")
+    print(f"Config exists: {os.path.exists(MODEL_CONFIG_PATH)}")
+    print("\nDone!")
