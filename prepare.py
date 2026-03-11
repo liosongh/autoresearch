@@ -24,10 +24,8 @@ from torch.utils.data import Dataset, DataLoader, RandomSampler
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-SEQ_LEN = 2000               # sliding window size (100ms intervals = 200 seconds)
-NUM_EPOCHS = 3                # number of training epochs
-EPOCH_TIME_BUDGET = 600       # max seconds per epoch (10 minutes)
-TOTAL_TIME_BUDGET = 1800      # max total training seconds (30 minutes)
+SEQ_LEN = 3000               # sliding window size (100ms intervals = 200 seconds)
+TIME_BUDGET = 300             # training time budget in seconds (5 minutes)
 NUM_CLASSES = 3               # [Down(0), Stationary(1), Up(2)]
 EVAL_SAMPLES = 10000          # number of samples for validation evaluation
 
